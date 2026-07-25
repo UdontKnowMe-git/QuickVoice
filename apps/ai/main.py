@@ -51,8 +51,16 @@ import subprocess
 import sys
 import time
 
+from pathlib import Path
+from dotenv import load_dotenv
+
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
+
+from langfuse import Langfuse
+from langfuse.decorators import observe, langfuse_context
+
+langfuse = Langfuse()
 
 API_PORT = int(os.getenv("AI_API_PORT", "5555"))
 DEFAULT_SYSTEM_PROMPT = (
@@ -348,6 +356,7 @@ class Assistant(Agent):
             )
 
     @function_tool
+    @observe(as_type="tool")
     async def record_call_extracted_data(self, field: str, value: str) -> str:
         """
         Record a configured data field collected from the caller during this call.
@@ -359,6 +368,7 @@ class Assistant(Agent):
         return self._metadata_collector.record_extracted_data(field, value)
 
     @function_tool
+    @observe(as_type="tool")
     async def record_call_evaluation(self, identifier: str, value: str) -> str:
         """
         Record a configured call evaluation result when the conversation provides enough evidence.
@@ -370,6 +380,7 @@ class Assistant(Agent):
         return self._metadata_collector.record_evaluation(identifier, value)
 
     @function_tool
+    @observe(as_type="generation")
     async def search_knowledge_base(self, query: str, top_k: int = 5) -> str:
         """
         Search the configured agent knowledge base for relevant context.
@@ -396,6 +407,7 @@ class Assistant(Agent):
         return context or "No matching knowledge base context found."
 
     @function_tool
+    @observe(as_type="tool")
     async def call_http_tool(self, tool_name: str, arguments_json: str = "{}") -> str:
         """
         Call an attached HTTP tool configured for this agent.
@@ -414,6 +426,7 @@ class Assistant(Agent):
         return json.dumps(result.get("data", result), ensure_ascii=False)
 
     @function_tool
+    @observe(as_type="tool")
     async def call_mcp_tool(self, connection_id: str, tool_name: str, arguments_json: str = "{}") -> str:
         """
         Call an attached MCP tool using a connected MCP connection.
@@ -488,6 +501,22 @@ async def entrypoint(ctx: JobContext):
         call_context["agent_id"] = config["agent_id"]
     if not call_context.get("provider") and config.get("provider"):
         call_context["provider"] = config["provider"]
+
+    session_id = ctx.room.name
+    agent_id = call_context.get("agent_id") or config.get("agent_id", "unknown")
+    
+    langfuse.trace(
+        name="voice-agent-session",
+        session_id=session_id,
+        user_id=call_context.get("caller_number", "unknown"),
+        metadata={
+            "agent_id": agent_id,
+            "provider": call_context.get("provider"),
+            "direction": call_context.get("direction")
+        },
+        tags=["livekit", "voice"]
+    )
+    langfuse_context.update_current_trace(session_id=session_id)
 
     try:
         provider_kwargs = build_session_provider_kwargs(config)
@@ -599,6 +628,7 @@ async def entrypoint(ctx: JobContext):
     shutdown_reason = "session_shutdown"
 
     async def unified_shutdown_hook():
+        langfuse.flush()
         try:
             await live_transcript_publisher.close(reason=shutdown_reason)
         except Exception as error:
